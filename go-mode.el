@@ -4,26 +4,65 @@
 ;; Use of this source code is governed by a BSD-style
 ;; license that can be found in the LICENSE file.
 
-;;
-;; Author: Dominik Honnef
-;; Version: 2013.03.02
-;; Keywords: Go major-mode
-;; URL: https://github.com/dominikh/go-mode.el
+;; Author: The Go Authors
+;; Version: 4
+;; Keywords: languages go
+;; URL: http://tip.golang.org/misc/emacs/
 ;;
 ;; This file is not part of GNU Emacs.
-;;
-;; Usage:
-;;  check https://github.com/dominikh/go-mode.el/blob/master/README.md
-;;
+
 ;;; Code:
 
 (require 'cl)
 (require 'ffap)
-(require 'find-lisp)
 (require 'url)
 
-(defun go--xemacs-p ()
-  (string-match "XEmacs\\|Lucid" emacs-version))
+;; XEmacs compatibility guidelines
+;; - Minimum required version of XEmacs: 21.5.32
+;;   - Feature that cannot be backported: POSIX character classes in
+;;     regular expressions
+;;   - Functions that could be backported but won't because 21.5.32
+;;     covers them: plenty.
+;;   - Features that are still partly broken:
+;;     - godef will not work correctly if multibyte characters are
+;;       being used
+;;     - Fontification will not handle unicode correctly
+;;
+;; - Do not use \_< and \_> regexp delimiters directly; use
+;;   go--regexp-enclose-in-symbol
+;;
+;; - The character `_` must not be a symbol constituent but a
+;;   character constituent
+;;
+;; - Do not use process-lines
+;;
+;; - Use go--old-completion-list-style when using a plain list as the
+;;   collection for completing-read
+;;
+;; - Use go--kill-whole-line instead of kill-whole-line (called
+;;   kill-entire-line in XEmacs)
+;;
+;; - Use go--position-bytes instead of position-bytes
+(defmacro go--xemacs-p ()
+  `(featurep 'xemacs))
+
+(defalias 'go--kill-whole-line
+  (if (fboundp 'kill-whole-line)
+      'kill-whole-line
+    'kill-entire-line))
+
+;; XEmacs unfortunately does not offer position-bytes. We can fall
+;; back to just using (point), but it will be incorrect as soon as
+;; multibyte characters are being used.
+(if (fboundp 'position-bytes)
+    (defalias 'go--position-bytes 'position-bytes)
+  (defun go--position-bytes (point) point))
+
+(defun go--old-completion-list-style (list)
+  (mapcar (lambda (x) (cons x nil)) list))
+
+(defalias 'go--prog-mode
+   (if (fboundp 'prog-mode) 'prog-mode 'fundamental-mode))
 
 (defun go--regexp-enclose-in-symbol (s)
   ;; XEmacs does not support \_<, GNU Emacs does. In GNU Emacs we make
@@ -60,6 +99,7 @@
 (defconst go-type-name-regexp (concat "\\(?:[*(]\\)*\\(?:" go-identifier-regexp "\\.\\)?\\(" go-identifier-regexp "\\)"))
 
 (defvar go-dangling-cache)
+(defvar go-godoc-history nil)
 
 (defgroup go nil
   "Major mode for editing Go code"
@@ -87,7 +127,7 @@
     (modify-syntax-entry ?=  "." st)
     (modify-syntax-entry ?<  "." st)
     (modify-syntax-entry ?>  "." st)
-    (modify-syntax-entry ?/  ". 124b" st)
+    (modify-syntax-entry ?/ (if (go--xemacs-p) ". 1456" ". 124b") st)
     (modify-syntax-entry ?*  ". 23" st)
     (modify-syntax-entry ?\n "> b" st)
     (modify-syntax-entry ?\" "\"" st)
@@ -176,7 +216,7 @@ It skips over whitespace, comments, cases and labels and, if
 STOP-AT-STRING is not true, over strings."
 
   (let (pos (start-pos (point)))
-    (skip-chars-backward "\n[:blank:]")
+    (skip-chars-backward "\n\s\t")
     (if (and (save-excursion (beginning-of-line) (go-in-string-p)) (looking-back "`") (not stop-at-string))
         (backward-char))
     (if (and (go-in-string-p) (not stop-at-string))
@@ -213,6 +253,28 @@ STOP-AT-STRING is not true, over strings."
               (puthash cur-line val go-dangling-cache))))
     val))
 
+(defun go--at-function-definition ()
+  "Return non-nil if point is on the opening curly brace of a
+function definition.
+
+We do this by first calling (beginning-of-defun), which will take
+us to the start of *some* function. We then look for the opening
+curly brace of that function and compare its position against the
+curly brace we are checking. If they match, we return non-nil."
+  (if (= (char-after) ?\{)
+      (save-excursion
+        (let ((old-point (point))
+              start-nesting)
+          (beginning-of-defun)
+          (when (looking-at "func ")
+            (setq start-nesting (go-paren-level))
+            (skip-chars-forward "^{")
+            (while (> (go-paren-level) start-nesting)
+              (forward-char)
+              (skip-chars-forward "^{") 0)
+            (if (and (= (go-paren-level) start-nesting) (= old-point (point)))
+                t))))))
+
 (defun go-goto-opening-parenthesis (&optional char)
   (let ((start-nesting (go-paren-level)))
     (while (and (not (bobp))
@@ -225,9 +287,23 @@ STOP-AT-STRING is not true, over strings."
               (go-goto-beginning-of-string-or-comment)
             (backward-char))))))
 
+(defun go--indentation-for-opening-parenthesis ()
+  "Return the semantic indentation for the current opening parenthesis.
+
+If point is on an opening curly brace and said curly brace
+belongs to a function declaration, the indentation of the func
+keyword will be returned. Otherwise the indentation of the
+current line will be returned."
+  (save-excursion
+    (if (go--at-function-definition)
+        (progn
+          (beginning-of-defun)
+          (current-indentation))
+      (current-indentation))))
+
 (defun go-indentation-at-point ()
   (save-excursion
-    (let (start-nesting (outindent 0))
+    (let (start-nesting)
       (back-to-indentation)
       (setq start-nesting (go-paren-level))
 
@@ -238,7 +314,7 @@ STOP-AT-STRING is not true, over strings."
         (go-goto-opening-parenthesis (char-after))
         (if (go-previous-line-has-dangling-op-p)
             (- (current-indentation) tab-width)
-          (current-indentation)))
+          (go--indentation-for-opening-parenthesis)))
        ((progn (go--backward-irrelevant t) (looking-back go-dangling-operators-regexp))
         ;; only one nesting for all dangling operators in one operation
         (if (go-previous-line-has-dangling-op-p)
@@ -249,7 +325,7 @@ STOP-AT-STRING is not true, over strings."
        ((progn (go-goto-opening-parenthesis) (< (go-paren-level) start-nesting))
         (if (go-previous-line-has-dangling-op-p)
             (current-indentation)
-          (+ (current-indentation) tab-width)))
+          (+ (go--indentation-for-opening-parenthesis) tab-width)))
        (t
         (current-indentation))))))
 
@@ -257,7 +333,6 @@ STOP-AT-STRING is not true, over strings."
   (interactive)
   (let (indent
         shift-amt
-        end
         (pos (- (point-max) (point)))
         (point (point))
         (beg (line-beginning-position)))
@@ -310,7 +385,7 @@ STOP-AT-STRING is not true, over strings."
       (forward-char))))
 
 ;;;###autoload
-(define-derived-mode go-mode prog-mode "Go"
+(define-derived-mode go-mode go--prog-mode "Go"
   "Major mode for editing Go source text.
 
 This mode provides (not just) basic editing capabilities for
@@ -335,11 +410,25 @@ The following extra functions are defined:
 - `go-goto-imports'
 - `go-play-buffer' and `go-play-region'
 - `go-download-play'
+- `godef-describe' and `godef-jump'
 
 If you want to automatically run `gofmt' before saving a file,
 add the following hook to your emacs configuration:
 
 \(add-hook 'before-save-hook 'gofmt-before-save)
+
+If you want to use `godef-jump' instead of etags (or similar),
+consider binding godef-jump to `M-.', which is the default key
+for `find-tag':
+
+\(add-hook 'go-mode-hook (lambda ()
+                          (local-set-key (kbd \"M-.\") 'godef-jump)))
+
+Please note that godef is an external dependency. You can install
+it with
+
+go get code.google.com/p/rog-go/exp/cmd/godef
+
 
 If you're looking for even more integration with Go, namely
 on-the-fly syntax checking, auto-completion and snippets, it is
@@ -398,6 +487,16 @@ recommended that you look at goflymake
 
 (defun go--apply-rcs-patch (patch-buffer)
   (let ((target-buffer (current-buffer))
+        ;; Relative offset between buffer line numbers and line numbers
+        ;; in patch.
+        ;;
+        ;; Line numbers in the patch are based on the source file, so
+        ;; we have to keep an offset when making changes to the
+        ;; buffer.
+        ;;
+        ;; Appending lines decrements the offset (possibly making it
+        ;; negative), deleting lines increments it. This order
+        ;; simplifies the forward-line invocations.
         (line-offset 0))
     (save-excursion
       (with-current-buffer patch-buffer
@@ -424,7 +523,7 @@ recommended that you look at goflymake
                 (goto-char (point-min))
                 (forward-line (- from line-offset 1))
                 (incf line-offset len)
-                (kill-whole-line len)))
+                (go--kill-whole-line len)))
              (t
               (error "invalid rcs patch or internal error in go--apply-rcs-patch")))))))))
 
@@ -450,12 +549,11 @@ recommended that you look at goflymake
     ;; is not an issue because gofmt -w does not produce any stdout
     ;; output in case of success.
     (if (zerop (call-process "gofmt" nil errbuf nil "-w" tmpfile))
-        (progn
-          (if (zerop (call-process-region (point-min) (point-max) "diff" nil patchbuf nil "-n" "-" tmpfile))
-              (message "Buffer is already gofmted")
-            (go--apply-rcs-patch patchbuf)
-            (kill-buffer errbuf)
-            (message "Applied gofmt")))
+        (if (zerop (call-process-region (point-min) (point-max) "diff" nil patchbuf nil "-n" "-" tmpfile))
+            (message "Buffer is already gofmted")
+          (go--apply-rcs-patch patchbuf)
+          (kill-buffer errbuf)
+          (message "Applied gofmt"))
       (message "Could not apply gofmt. Check errors for details")
       (gofmt--process-errors (buffer-file-name) tmpfile errbuf))
 
@@ -496,7 +594,7 @@ you save any file, kind of defeating the point of autoloading."
     (completing-read (if symbol
                          (format "godoc (default %s): " symbol)
                        "godoc: ")
-                     (go-packages) nil nil nil nil symbol)))
+                     (go--old-completion-list-style (go-packages)) nil nil nil 'go-godoc-history symbol)))
 
 (defun godoc--get-buffer (query)
   "Get an empty buffer for a godoc query."
@@ -645,7 +743,7 @@ uncommented, otherwise a new import will be added."
   (interactive
    (list
     current-prefix-arg
-    (replace-regexp-in-string "^[\"']\\|[\"']$" "" (completing-read "Package: " (go-packages)))))
+    (replace-regexp-in-string "^[\"']\\|[\"']$" "" (completing-read "Package: " (go--old-completion-list-style (go-packages))))))
   (save-excursion
     (let (as line import-start)
       (if arg
@@ -670,14 +768,32 @@ uncommented, otherwise a new import will be added."
           ('none (insert "\nimport (\n\t" line "\n)\n")))))))
 
 (defun go-root-and-paths ()
-  (let* ((output (process-lines "go" "env" "GOROOT" "GOPATH"))
+  (let* ((output (split-string (shell-command-to-string "go env GOROOT GOPATH") "\n"))
          (root (car output))
-         (paths (split-string (car (cdr output)) ":")))
+         (paths (split-string (cadr output) ":")))
     (append (list root) paths)))
 
 (defun go--string-prefix-p (s1 s2 &optional ignore-case)
+  "Return non-nil if S1 is a prefix of S2.
+If IGNORE-CASE is non-nil, the comparison is case-insensitive."
   (eq t (compare-strings s1 nil nil
                          s2 0 (length s1) ignore-case)))
+
+(defun go--directory-dirs (dir)
+  "Recursively return all subdirectories in DIR."
+  (if (file-directory-p dir)
+      (let ((dir (directory-file-name dir))
+            (dirs '())
+            (files (directory-files dir nil nil t)))
+        (dolist (file files)
+          (unless (member file '("." ".."))
+            (let ((file (concat dir "/" file)))
+              (if (file-directory-p file)
+                  (setq dirs (append (cons file
+                                           (go--directory-dirs file))
+                                     dirs))))))
+        dirs)
+    '()))
 
 
 (defun go-packages ()
@@ -694,7 +810,7 @@ uncommented, otherwise a new import will be added."
                            (if (file-directory-p dir)
                                (directory-files dir t "\\.a$"))))
                  (if (file-directory-p pkgdir)
-                     (find-lisp-find-files-internal pkgdir 'find-lisp-file-predicate-is-directory 'find-lisp-default-directory-predicate)))))
+                     (go--directory-dirs pkgdir)))))
      (go-root-and-paths)))
    'string<))
 
@@ -734,7 +850,7 @@ will be commented, otherwise they will be removed completely."
           (beginning-of-line)
           (if arg
               (comment-region (line-beginning-position) (line-end-position))
-            (kill-whole-line)))
+            (go--kill-whole-line)))
         (message "Removed %d imports" (length lines)))
       (if flymake-state (flymake-mode-on)))))
 
@@ -756,13 +872,13 @@ visit FILENAME and go to line LINE and column COLUMN."
   "Call godef, acquiring definition position and expression
 description at POINT."
   (if (go--xemacs-p)
-      (error "godef does not reliably work in XEmacs, sorry"))
+      (message "godef does not reliably work in XEmacs, expect bad results"))
   (if (not buffer-file-name)
       (message "Cannot use godef on a buffer without a file name")
     (let ((outbuf (get-buffer-create "*godef*")))
       (with-current-buffer outbuf
         (erase-buffer))
-      (call-process-region (point-min) (point-max) "godef" nil outbuf nil "-i" "-t" "-f" (file-truename buffer-file-name) "-o" (number-to-string (position-bytes (point))))
+      (call-process-region (point-min) (point-max) "godef" nil outbuf nil "-i" "-t" "-f" (file-truename buffer-file-name) "-o" (number-to-string (go--position-bytes (point))))
       (with-current-buffer outbuf
         (split-string (buffer-substring-no-properties (point-min) (point-max)) "\n")))))
 
@@ -789,6 +905,7 @@ description at POINT."
          ((go--string-prefix-p "godef: no declaration found for " file)
           (message "%s" file))
          (t
+          (push-mark)
           (godef--find-file-line-column file))))
     (file-error (message "Could not run godef binary"))))
 

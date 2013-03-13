@@ -76,9 +76,29 @@ checking and [gocode](https://github.com/nsf/gocode) for auto
 completion. Some features require you to install godef via `go get
 code.google.com/p/rog-go/exp/cmd/godef`.
 
-Alternatively there is also [flymake-go](http://marmalade-repo.org/packages/flymake-go) package
-distributed with _package.el_. It uses _go fmt_ for syntax validation on the fly. It doesn't require
-building additional go modules.
+Alternatively there is also
+[flymake-go](http://marmalade-repo.org/packages/flymake-go), which
+uses _gofmt_ to check for syntax errors and doesn't require installing
+any additional binaries. It **only** catches syntactic errors though.
 
 Also, if you're using YASnippet, consider using the snippets from
 [yasnippet-go](https://github.com/dominikh/yasnippet-go).
+
+Contributing
+============
+
+Because go-mode.el is also part of the Go distribution, there are
+essentially two ways to contribute changes:
+
+- By sending a pull request on GitHub
+- By submitting a CL to the Go project
+
+Because of copyright reasons, I will not accept any non-trivial
+contributions via pull requests. Please submit a CL instead. This will
+ensure that the changes go through a proper review process and that
+your name will be noted in the list of contributors and possibly
+authors. Instructions can be found at
+http://golang.org/doc/contribute.html.
+
+Trivial changes, and changes to files that are not part of the Go
+distribution (mainly this README), can be submitted via pull request.
